@@ -22,6 +22,8 @@ This plugin gives the conversation a table of contents you can search.
 | Quote filter | Keeps only the messages that quote an earlier message |
 | Jump to message | Click a card, the conversation scrolls to that row and marks it with a fading blue arrow |
 | Quote badge | `#N` after the quote icon names the message that was quoted |
+| Live updates | New messages appear as they are sent; no reload, and the list survives tab switches |
+| Copy / reinsert | Every card can copy its text or put it back into the composer with one click |
 | Frosted search strip | The search bar floats above the list with a frosted-glass surface |
 | Light and dark | Built on theme tokens only (`--dsw-alias-*` / `--dsw-static-*`), so it follows the active theme |
 | Bilingual UI | Chinese and English, following the app locale |
@@ -61,6 +63,17 @@ change `cordis.patch.yml` to match.
 3. Type in the search box to filter and highlight; use the two buttons in the strip to keep only
    image messages or only quoting messages.
 4. Click a card to jump. The target row gets a blue arrow that fades out once.
+5. Hover a card for two buttons: copy the message text, or put it back into the composer.
+
+## Known limits
+
+- The list covers the most recent 40 pages of session events (thousands of messages in practice).
+  Older messages are not listed, and `#N` numbering starts at the earliest message that was loaded.
+- The first open of a long session reads its history once; switching back to the same session reuses
+  the cache and only fetches the new tail.
+- Copy and reinsert need the session context the tab cannot see directly, so they are bridged through
+  an invisible slot inside the composer. If a future Harness drops that slot, the reinsert button
+  becomes disabled while copy keeps working.
 
 ## Project layout
 

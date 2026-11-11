@@ -14,6 +14,8 @@
   const TAB_KIND = 'dsh-history-search';
   const PAGE_BUDGET = 400;
   const MAX_PAGES = 40;
+  const TAIL_PAGES = 5; // bounded backward walk while catching up with the cache
+  const CACHE_MAX = 8; // keep at most this many per-session card caches
   const LOCATE_TIMEOUT_MS = 30000;
   const LOCATE_INTERVAL_MS = 140;
   const LOAD_THROTTLE_MS = 500;
@@ -36,22 +38,19 @@
       unit: '条',
       hasImage: '含图片',
       imageOnly: '（图片消息）',
-      quoteCount: (n) => `引用 ${n} 处`,
       quoteFrom: (n) => `引用自消息 ${n}`,
       quoteOnly: '（引用消息）',
       filterImage: '只看含图片的消息',
       filterQuote: '只看含引用的消息',
-      locating: '正在定位消息…',
-      locatingPrecise: '正在精确加载到这条消息…',
-      fallingBack: '精确加载不可用，正在手动翻页…',
-      loadingEarlier: (n) => `正在加载更早的对话…（已尝试 ${n} 次）`,
-      loadingWait: (n) => `正在载入更早的对话…（已尝试 ${n} 次）`,
-      reachedTop: '未能跳转：已翻到会话最开头，仍未找到这条消息，已定位到当前最早一条',
-      loadFailedStuck: '未能跳转：已反复尝试加载更早对话，但这条消息仍未出现（可能已超出当前会话可加载范围），已定位到当前已加载的最早一条',
-      loadFailedTimeout: '未能跳转：等待加载更早对话超时，已定位到当前已加载的最早一条',
+      copy: '复制内容',
+      copied: '已复制',
+      copyFailed: '复制失败，请手动选择文本',
+      insert: '填回输入框',
+      insertBlocked: '输入框当前不可编辑',
+      insertUnavailable: '输入框尚未就绪',
+      retry: '重试',
       emptyAll: '这个会话里还没有你发的消息',
       emptyMatch: '没有匹配的消息',
-      loading: '加载中…',
       failed: (m) => `读取失败：${m}`,
       noService: '会话数据服务尚未就绪',
       noSession: '未检测到已打开的会话',
@@ -69,21 +68,19 @@
       unit: '',
       hasImage: 'Contains image',
       imageOnly: '(image message)',
-      quoteCount: (n) => `${n} quote${n === 1 ? '' : 's'}`,
-      quoteFrom: (n) => `Quoted from message ${n}`,      quoteOnly: '(quote message)',
+      quoteFrom: (n) => `Quoted from message ${n}`,
+      quoteOnly: '(quote message)',
       filterImage: 'Only messages with images',
       filterQuote: 'Only messages with quotes',
-      loadingEarlier: (n) => `Loading earlier messages… (attempt ${n})`,
-      loadingWait: (n) => `Loading earlier messages… (attempt ${n})`,
-      locating: 'Locating message…',
-      locatingPrecise: 'Precisely loading this message…',
-      fallingBack: 'Precise loading unavailable; paging manually…',
-      reachedTop: 'Jump failed: reached the very beginning of the conversation without finding this message; jumped to the earliest loaded row instead.',
-      loadFailedStuck: 'Jump failed: tried loading earlier messages repeatedly but this one did not appear; jumped to the earliest currently loaded message instead.',
-      loadFailedTimeout: 'Jump failed: timed out waiting for earlier messages; jumped to the earliest currently loaded message instead.',
+      copy: 'Copy text',
+      copied: 'Copied',
+      copyFailed: 'Copy failed — select the text manually',
+      insert: 'Insert into composer',
+      insertBlocked: 'The composer is not editable right now',
+      insertUnavailable: 'The composer is not ready yet',
+      retry: 'Retry',
       emptyAll: 'No messages you sent in this conversation yet',
       emptyMatch: 'No matching messages',
-      loading: 'Loading…',
       failed: (m) => `Failed: ${m}`,
       noService: 'Session data service is not ready',
       noSession: 'No open conversation detected',
@@ -272,46 +269,179 @@
         return undefined;
       }
 
-      async function loadUserMessages(api, sessionId, signal) {
-        if (!api || !sessionId) return [];
-        const all = [];
-        // Turn ordinal map: "which user message started engine turn N". The
-        // engine turn number comes from turn/start / step/start events, NOT
-        // from user/message (its data has no turn field). We track the open
-        // turn while walking the stream; the first user message inside a turn
-        // is recorded as that turn's starter. A quote sourced from an
-        // assistant step ("14:assistant-step<turn>:<step>") resolves through
-        // this map to the user message that began the turn.
-        const turnToOrdinal = {};
-        let openTurn = null;
-        let ordinalCounter = 0;
-        // Records may arrive newest-first per page (backward cursor); collect
-        // all events first, then walk them in true chronological order.
-        const rawEvents = [];
-        let beforeSeq;
-        for (let page = 0; page < MAX_PAGES; page++) {
-          const request = {
-            address: { kind: 'session', sessionId },
-            maxMessages: PAGE_BUDGET,
+/* ---------------------------------------------------------------- *
+       * Per-session card cache.                                           *
+       *                                                                   *
+       * Session events are an append-only log, so a card list built once  *
+       * stays valid later: reopening a session only needs the tail delta, *
+       * not another 40-page sweep of the whole conversation.              *
+       * ---------------------------------------------------------------- */
+      const CACHE = new Map(); // sessionId -> cache record
+
+      function newCache() {
+        return {
+          cards: [],          // chronological, oldest -> newest
+          bySeq: new Map(),   // event seq -> card
+          byId: new Map(),    // message id (string) -> card
+          turnToOrdinal: {},  // engine turn -> ordinal of the message that opened it
+          openTurn: null,
+          ordinal: 0,
+          lastSeq: -1,
+          ready: false,
+          historyComplete: false,
+        };
+      }
+
+      function ensureCache(sessionId) {
+        let cache = CACHE.get(sessionId);
+        if (cache) return cache;
+        cache = newCache();
+        CACHE.set(sessionId, cache);
+        while (CACHE.size > CACHE_MAX) {
+          const oldest = CACHE.keys().next().value;
+          if (oldest === sessionId) break;
+          CACHE.delete(oldest);
+        }
+        return cache;
+      }
+
+      // Turn ordinal map: "which user message started engine turn N". The
+      // engine turn number comes from turn/start / step/start events, NOT from
+      // user/message (its data has no turn field). A quote sourced from an
+      // assistant step ("14:assistant-step<turn>:<step>") resolves through this
+      // map to the user message that began the turn.
+      //
+      // Every batch is either a full rebuild (reset) or an append-only delta;
+      // seq is monotonic, so "seq > lastSeq" is exactly "not applied yet".
+      // Older pages are never merged: the list only grows at the tail, which
+      // keeps ordinals stable while a session stays open.
+      function applyEvents(cache, events, reset) {
+        if (!cache || !Array.isArray(events)) return 0;
+        if (reset) {
+          cache.cards = [];
+          cache.bySeq = new Map();
+          cache.byId = new Map();
+          cache.turnToOrdinal = {};
+          cache.openTurn = null;
+          cache.ordinal = 0;
+          cache.lastSeq = -1;
+        }
+        const fresh = [];
+        const seen = new Set();
+        for (const e of events) {
+          if (!e || typeof e !== 'object') continue;
+          const seq = e.seq;
+          if (typeof seq !== 'number' || !isFinite(seq)) continue;
+          if (seq <= cache.lastSeq || seen.has(seq)) continue;
+          seen.add(seq);
+          fresh.push(e);
+        }
+        if (fresh.length === 0) return 0;
+        fresh.sort((a, b) => a.seq - b.seq);
+        const added = [];
+        for (const e of fresh) {
+          const data = e.data || {};
+          if (e.type === 'turn/start' && typeof data.turn === 'number') {
+            cache.openTurn = data.turn;
+          } else if (e.type === 'step/start' && typeof data.turn === 'number') {
+            if (cache.openTurn === null) cache.openTurn = data.turn;
+          } else if (e.type === 'turn/end') {
+            cache.openTurn = null;
+          }
+          const msg = userText(e);
+          if (!msg) continue;
+          cache.ordinal += 1;
+          if (cache.openTurn !== null && !(cache.openTurn in cache.turnToOrdinal)) {
+            cache.turnToOrdinal[cache.openTurn] = cache.ordinal;
+          }
+          const card = {
+            seq: e.seq,
+            time: e.time,
+            text: msg.text || '',
+            hasImage: msg.hasImage,
+            quotes: msg.quotes || [],
+            id: dataId(e),
+            ordinal: cache.ordinal,
           };
-          if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
+          cache.cards.push(card);
+          cache.bySeq.set(card.seq, card);
+          if (card.id !== undefined && card.id !== null) cache.byId.set(String(card.id), card);
+          added.push(card);
+        }
+        cache.lastSeq = fresh[fresh.length - 1].seq;
+        if (added.length) resolveQuoteOrdinals(cache, added);
+        return added.length;
+      }
 
-          let outcome;
-          try {
-            outcome = await api.events(request, signal);
-          } catch (err) {
-            // Some client generations omit the cancellation parameter.
-            try { outcome = await api.events(request); }
-            catch (err2) { throw err2; }
+      // Resolve quote ordinals for the cards just appended.
+      // 1) user-sourced: the flow key tail is the source message's data.id.
+      // 2) assistant/tool-sourced: parse the turn number out of the flow key
+      //    ("14:assistant-step<turn>:<step>") and map it through
+      //    turnToOrdinal to the user message that started that turn.
+      function resolveQuoteOrdinals(cache, cards) {
+        for (const card of cards) {
+          for (const q of card.quotes || []) {
+            if (q.ordinal) continue;
+            let resolved = null;
+            if (q.kind === 'user') {
+              const key = /input-message(.+)$/.exec(q.messageId);
+              const direct = key ? cache.byId.get(key[1]) : undefined;
+              if (direct) resolved = direct.ordinal;
+              else {
+                for (const c of cache.cards) {
+                  if (c.id !== undefined && c.id !== null && q.messageId.endsWith(String(c.id))) {
+                    resolved = c.ordinal;
+                    break;
+                  }
+                }
+              }
+            } else {
+              // Assistant flow keys embed the turn: "14:assistant-step19:18".
+              const m = /assistant-step(\d+):/.exec(q.messageId) ||
+                        /turn-process(\d+):/.exec(q.messageId);
+              if (m) {
+                const turn = Number(m[1]);
+                if (turn in cache.turnToOrdinal) resolved = cache.turnToOrdinal[turn];
+              }
+            }
+            q.ordinal = resolved;
           }
-          // RemoteResult envelope { ok, value } or a bare SessionEventsPage.
-          let result = outcome;
-          if (outcome && typeof outcome === 'object' && 'ok' in outcome) {
-            if (!outcome.ok) throw new Error((outcome.error && outcome.error.message) || 'remote error');
-            result = outcome.value;
-          }
+        }
+      }
+
+      async function fetchPage(api, sessionId, beforeSeq, signal) {
+        const request = {
+          address: { kind: 'session', sessionId },
+          maxMessages: PAGE_BUDGET,
+        };
+        if (beforeSeq !== undefined) request.beforeSeq = beforeSeq;
+        let outcome;
+        try {
+          outcome = await api.events(request, signal);
+        } catch (err) {
+          if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) throw err;
+          // Some client generations omit the cancellation parameter.
+          outcome = await api.events(request);
+        }
+        // RemoteResult envelope { ok, value } or a bare SessionEventsPage.
+        let result = outcome;
+        if (outcome && typeof outcome === 'object' && 'ok' in outcome) {
+          if (!outcome.ok) throw new Error((outcome.error && outcome.error.message) || 'remote error');
+          result = outcome.value;
+        }
+        return result || null;
+      }
+
+      // Full sweep: page backwards until the conversation start or the budget
+      // runs out. Records may arrive newest-first per page (backward cursor), so
+      // everything is collected first and sorted into chronological order.
+      async function loadHistory(api, sessionId, signal) {
+        const events = [];
+        let beforeSeq;
+        let complete = false;
+        for (let page = 0; page < MAX_PAGES; page++) {
+          const result = await fetchPage(api, sessionId, beforeSeq, signal);
           if (!result || !Array.isArray(result.records)) break;
-
           let minSeq;
           for (const record of result.records) {
             const e = record && record.event;
@@ -319,72 +449,75 @@
             if (typeof e.seq === 'number' && isFinite(e.seq)) {
               if (minSeq === undefined || e.seq < minSeq) minSeq = e.seq;
             }
-            rawEvents.push(e);
+            events.push(e);
           }
-          if (!result.hasMore || minSeq === undefined) break;
+          if (!result.hasMore || minSeq === undefined) { complete = !result.hasMore; break; }
           // beforeSeq is a backward cursor: ask for the page strictly older
           // than the oldest event we just saw. Using the minimum keeps this
           // correct whether `records` is chronological or reverse-chronological.
           if (beforeSeq !== undefined && minSeq >= beforeSeq) break; // no progress
           beforeSeq = minSeq;
         }
+        events.sort((a, b) => (a.seq || 0) - (b.seq || 0));
+        return { events, complete };
+      }
 
-        // Walk chronologically: track open turns and count user-message ordinals.
-        rawEvents.sort((a, b) => (a.seq || 0) - (b.seq || 0));
-        for (const e of rawEvents) {
-          const data = e.data || {};
-          if (e.type === 'turn/start' && typeof data.turn === 'number') {
-            openTurn = data.turn;
-          } else if (e.type === 'step/start' && typeof data.turn === 'number') {
-            if (openTurn === null) openTurn = data.turn;
-          } else if (e.type === 'turn/end') {
-            openTurn = null;
-          }
-          const msg = userText(e);
-          if (msg) {
-            ordinalCounter += 1;
-            if (openTurn !== null && !(openTurn in turnToOrdinal)) {
-              turnToOrdinal[openTurn] = ordinalCounter;
+      // Cheap revalidation for a cached session: one tail page in the common
+      // case. When the newest page no longer overlaps what we hold, the gap is
+      // reported so the caller can fall back to a full rebuild.
+      async function syncTail(api, sessionId, cache, signal) {
+        const floor = cache.lastSeq;
+        const collected = [];
+        let beforeSeq;
+        for (let page = 0; page < TAIL_PAGES; page++) {
+          const result = await fetchPage(api, sessionId, beforeSeq, signal);
+          if (!result || !Array.isArray(result.records)) return false;
+          if (result.records.length === 0) return true; // nothing new
+          let minSeq;
+          for (const record of result.records) {
+            const e = record && record.event;
+            if (!e) continue;
+            if (typeof e.seq === 'number' && isFinite(e.seq)) {
+              if (minSeq === undefined || e.seq < minSeq) minSeq = e.seq;
             }
-            all.push({
-              seq: e.seq,
-              time: e.time,
-              text: msg.text || '',
-              hasImage: msg.hasImage,
-              quotes: msg.quotes || [],
-              id: dataId(e),
-              sessionId,
-              ordinal: ordinalCounter,
-            });
+            collected.push(e);
           }
+          if (minSeq === undefined) return false;
+          if (minSeq <= floor) { // overlaps what we hold: the merge is gapless
+            applyEvents(cache, collected, false);
+            return true;
+          }
+          if (!result.hasMore) return false;
+          beforeSeq = minSeq;
         }
+        return false;
+      }
 
-        // Resolve quote ordinals.
-        // 1) user-sourced: the flow key tail is the source message's data.id;
-        //    match it against the card list.
-        // 2) assistant/tool-sourced: parse the turn number out of the flow key
-        //    ("14:assistant-step<turn>:<step>") and map it through
-        //    turnToOrdinal to the user message that started that turn.
-        for (const card of all) {
-          for (const q of card.quotes || []) {
-            let resolved = null;
-            if (q.kind === 'user') {
-              const target = all.find((c) => c.id !== undefined && c.id !== null &&
-                q.messageId.endsWith(String(c.id)));
-              if (target) resolved = target.ordinal;
-            } else {
-              // Assistant flow keys embed the turn: "14:assistant-step19:18".
-              const m = /assistant-step(\d+):/.exec(q.messageId) ||
-                        /turn-process(\d+):/.exec(q.messageId);
-              if (m) {
-                const turn = Number(m[1]);
-                if (turn in turnToOrdinal) resolved = turnToOrdinal[turn];
-              }
-            }
-            q.ordinal = resolved;
-          }
+      // Live source: the very Session object the chat view reads. Its
+      // `eventSource` publishes the loaded window, and every notification
+      // carries entries we can merge by seq (duplicates are ignored).
+      function liveBinding(sessionId) {
+        try {
+          const svc = sessionsSvc;
+          if (!svc || typeof svc.binding !== 'function') return null;
+          const binding = svc.binding(sessionId);
+          const session = binding && binding.session;
+          const source = session && session.eventSource;
+          if (!source || typeof source.subscribe !== 'function' ||
+              typeof source.getSnapshot !== 'function') return null;
+          return { binding, source };
+        } catch (_) { return null; }
+      }
+
+      function eventsFromSnapshot(snapshot) {
+        const entries = snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : [];
+        const out = [];
+        for (const entry of entries) {
+          if (!entry) continue;
+          const e = entry.event || entry;
+          if (e && typeof e.type === 'string') out.push(e);
         }
-        return all;
+        return out;
       }
 
       function dataId(e) {
@@ -458,7 +591,7 @@
         }
 
         // 1) Identity by message id. data-chat-node-key is a synthetic value
-        //    `${kind.length}:input-message<event.data.id>` (ui-conversation's
+        //    `${kind.length}:input-message${event.data.id}` (ui-conversation's
         //    conversationContextKey), NOT the bare id. Require a unique hit.
         const id = card.id === undefined ? '' : String(card.id);
         if (id) {
@@ -681,7 +814,7 @@
         }
       }
 
-      function locate(card, openView, t, report, sessionId) {
+      function locate(card, openView, t, sessionId) {
         const myToken = ++jumpToken;
         const started = Date.now();
         let lastEnsure = 0;
@@ -691,15 +824,13 @@
         let preciseDone = false; // loadThrough() settled (or was unavailable)
         let preciseSettledAt = 0; // when loadThrough() settled (render grace start)
 
-        try { if (report) report(t('locating')); } catch (_) {}
         try { console.log('[dsh-history-search] locate start', JSON.stringify({ seq: card.seq, ordinal: card.ordinal, id: card.id, sessionId })); } catch (_) {}
 
-        const giveUp = (key) => {
+        const giveUp = () => {
           const ordered = userRowsInOrder();
           const earliest = ordered.length ? ordered[0] : earliestLoadedRow();
           if (earliest) flashRow(earliest);
           else scrollFlowTop();
-          try { if (report) report(t(key)); } catch (_) {}
         };
 
         const tick = () => {
@@ -729,7 +860,6 @@
           if (row) {
             try { console.log('[dsh-history-search] found row, flashing', card.ordinal); } catch (_) {}
             flashRow(row);
-            try { if (report) report(''); } catch (_) {} // clear the notice
             return;
           }
 
@@ -740,7 +870,7 @@
           // what left the view stuck at the first loaded page. Wait for the
           // precise loader to settle; only then fall back to the button.
           if (!preciseDone) {
-            if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp('loadFailedTimeout'); return; }
+            if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp(); return; }
             window.setTimeout(tick, LOCATE_INTERVAL_MS);
             return;
           }
@@ -750,7 +880,7 @@
           // Don't reach for the button during this window either (same
           // beginPaging hazard) — just keep polling.
           if (preciseSettledAt && (Date.now() - preciseSettledAt) < 600) {
-            if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp('loadFailedTimeout'); return; }
+            if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp(); return; }
             window.setTimeout(tick, LOCATE_INTERVAL_MS);
             return;
           }
@@ -762,24 +892,18 @@
             lastLoad = Date.now();
             const state = triggerLoadEarlier();
             if (state === 'clicked') loadAttempts += 1;
-            try {
-              if (report) report(state === 'loading' || state === 'clicked'
-                ? t('loadingWait', loadAttempts || 1)
-                : t('loadingEarlier', loadAttempts || 1));
-            } catch (_) {}
             const topNow = buttonGoneSince > 0 &&
               (Date.now() - buttonGoneSince) >= TOP_SETTLE_MS;
             row = findRow(card, topNow);
             if (row) {
               flashRow(row);
-              try { if (report) report(''); } catch (_) {}
               return;
             }
-            if (topNow) { giveUp('reachedTop'); return; }
+            if (topNow) { giveUp(); return; }
           }
 
-          if (loadAttempts >= MAX_LOAD_ATTEMPTS) { giveUp('loadFailedStuck'); return; }
-          if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp('loadFailedTimeout'); return; }
+          if (loadAttempts >= MAX_LOAD_ATTEMPTS) { giveUp(); return; }
+          if (Date.now() - started >= LOCATE_TIMEOUT_MS) { giveUp(); return; }
           window.setTimeout(tick, LOCATE_INTERVAL_MS);
         };
 
@@ -788,7 +912,6 @@
         // button fallback) only begins once the precise path has settled.
         const precise = loadThroughTarget(card, sessionId);
         if (precise) {
-          try { if (report) report(t('locatingPrecise')); } catch (_) {}
           const timeout = new Promise((resolve) => window.setTimeout(resolve, 8000));
           Promise.race([precise, timeout]).then(() => {
             if (myToken !== jumpToken) return;
@@ -801,7 +924,6 @@
           window.setTimeout(tick, 60);
         } else {
           preciseDone = true;
-          try { if (report) report(t('fallingBack')); } catch (_) {}
           try { console.warn('[dsh-history-search] loadThrough unavailable, falling back to button paging'); } catch (_) {}
           window.setTimeout(tick, 60);
         }
@@ -813,14 +935,14 @@
         try { return ctx && ctx[name] ? ctx[name] : undefined; } catch (_) { return undefined; }
       }
 
-      function jumpTo(card, ctx, openView, currentId, t, report) {
+      function jumpTo(card, ctx, openView, currentId, t) {
         const layout = layoutApi || resolveService(ctx, 'layout');
         const workspace = workspaceApi || resolveService(ctx, 'uiWorkspace');
         try { if (layout && typeof layout.selectPanel === 'function') layout.selectPanel(null); } catch (_) {}
         if (card.sessionId && card.sessionId !== currentId) {
           try { if (workspace && typeof workspace.openSession === 'function') workspace.openSession(card.sessionId); } catch (_) {}
         }
-        locate(card, openView, t, report, card.sessionId || currentId);
+        locate(card, openView, t, card.sessionId || currentId);
       }
 
       /* ---------------------------------------------------------------- *
@@ -960,8 +1082,15 @@
   color: var(--dsw-alias-label-tertiary);
 }
 .dhs-status.is-error { color: var(--dsw-alias-state-error-primary); }
+.dhs-retry {
+  margin-left: 8px; padding: 0; border: none; background: transparent;
+  color: var(--dsw-alias-brand-primary); font: inherit; cursor: pointer;
+}
+.dhs-retry:hover { text-decoration: underline; }
 
-/* Card: borderless, transparent; hover only tints the background. */
+/* Card: borderless, transparent; hover only tints the background. It is a div
+   with role="button" so the copy / insert controls can live inside it — a
+   <button> inside a <button> is invalid HTML. */
 .dhs-card {
   position: relative; display: block; width: 100%; padding: 0;
   text-align: left; cursor: pointer; border: none; border-radius: 12px;
@@ -1018,6 +1147,27 @@
   white-space: pre-wrap; word-break: break-word;
   max-height: 96px; overflow: hidden;
 }
+/* Copy / insert controls sit at the right end of the meta row. visibility
+   (not display/opacity) keeps the row height and the text width stable, so
+   hovering a card never reflows it. */
+.dhs-actions {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 2px;
+  visibility: hidden;
+}
+.dhs-card:hover .dhs-actions,
+.dhs-card:focus-within .dhs-actions { visibility: visible; }
+.dhs-actbtn {
+  width: 24px; height: 24px; padding: 0; border: none; border-radius: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--dsw-alias-label-tertiary);
+  cursor: pointer; transition: background .12s ease, color .12s ease;
+}
+.dhs-actbtn:hover {
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+}
+.dhs-actbtn:disabled { cursor: default; opacity: .45; }
+.dhs-actbtn:disabled:hover { background: transparent; color: var(--dsw-alias-label-tertiary); }
 .dhs-mark {
   background: rgba(255,196,0,0.42);
   background: color-mix(in srgb, var(--dsw-static-amber-100) 58%, transparent);
@@ -1112,46 +1262,109 @@
           h('circle', { cx: 16.5, cy: 16.5, r: 3.5 }),
           h('path', { d: 'M19.2 19.2 22 22' }));
       }
-
-      function renderCardList(allItems, items, shown, q, hasFilter, t, ctx, openView, sessionId, timeLocale) {
-        if (items !== null && shown.length === 0) {
-          return h('div', { className: 'dhs-empty' },
-            hasFilter ? t('emptyMatch') : t('emptyAll'));
-        }
-        return (items || []).length === 0 && items !== null
-          ? null
-          : shown.map((card) => renderCard(card, q, t, ctx, openView, sessionId, timeLocale, allItems));
+      // Two offset sheets (Lucide "copy"): the copy-to-clipboard control.
+      function CopyIcon(props) {
+        const s = (props && props.size) || 14;
+        return h('svg', { width: s, height: s, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.9, strokeLinecap: 'round', strokeLinejoin: 'round',
+          'aria-hidden': 'true', focusable: 'false' },
+          h('rect', { x: 9, y: 9, width: 12, height: 12, rx: 2, ry: 2 }),
+          h('path', { d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' }));
+      }
+      // Check mark: transient confirmation after a successful copy.
+      function CheckIcon(props) {
+        const s = (props && props.size) || 14;
+        return h('svg', { width: s, height: s, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 2.2, strokeLinecap: 'round', strokeLinejoin: 'round',
+          'aria-hidden': 'true', focusable: 'false' },
+          h('path', { d: 'M20 6 9 17l-5-5' }));
+      }
+      // Arrow turning into a box (Lucide "corner-down-left"): insert into composer.
+      function InsertIcon(props) {
+        const s = (props && props.size) || 14;
+        return h('svg', { width: s, height: s, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.9, strokeLinecap: 'round', strokeLinejoin: 'round',
+          'aria-hidden': 'true', focusable: 'false' },
+          h('path', { d: 'M9 10l-5 5 5 5' }),
+          h('path', { d: 'M20 4v7a4 4 0 0 1-4 4H4' }));
       }
 
-      // Resolve a quote's source message id to "the Nth message you sent" in
-      // THIS conversation. quote.source.messageId is a chat flow key of the
-      // form `${len}:input-message<event.data.id>` — its tail is the id our
-      // cards already carry. Returns the ordinal number, or null when the
-      // quoted text came from a model reply / another session / an unloaded
-      // message.
-      function ordinalOfMsgId(cards, flowKey) {
-        if (!flowKey) return null;
-        for (const card of cards || []) {
-          if (card.id !== undefined && card.id !== null &&
-              flowKey.endsWith(String(card.id))) {
-            return card.ordinal || null;
-          }
-        }
-        return null;
-      }
+/* ---------------------------------------------------------------- *
+       * Card.                                                             *
+       * ---------------------------------------------------------------- */
+      const Card = React.memo(function HistoryCard(props) {
+        const card = props.card;
+        const q = props.q;
+        const t = props.t;
+        const ctx = props.ctx;
+        const openView = props.openView;
+        const sessionId = props.sessionId;
+        const timeLocale = props.timeLocale;
+        const actions = props.actions;
+        const onNotice = props.onNotice;
 
-      function renderCard(card, q, t, ctx, openView, sessionId, timeLocale, allItems) {
+        const [copied, setCopied] = React.useState(false);
+        const timer = React.useRef(0);
+        React.useEffect(() => () => {
+          if (timer.current) window.clearTimeout(timer.current);
+        }, []);
+
         const text = card.text || '';
         const preview = text.length > PREVIEW_CHARS
           ? text.slice(0, PREVIEW_CHARS) + '…' : text;
-        return h('button', {
-          key: String(card.seq) + ':' + (card.id || ''),
-          className: 'dhs-card', type: 'button',
-          // No jump-progress notices any more: `report` is intentionally null.
-          onClick: () => jumpTo(card, ctx, openView, sessionId, t, null),
+        // Blue quote bubble + the ordinal(s) of the message(s) in THIS
+        // conversation that the quoted text came from. The data layer already
+        // resolved each quote (user-sourced via message id, assistant-sourced
+        // through the turn that prompted it).
+        const quoteOrdinals = (card.quotes || [])
+          .map((x) => (x.ordinal ? '#' + x.ordinal : '?'));
+
+        const jump = () => jumpTo(card, ctx, openView, sessionId, t);
+
+        const handleCopy = (e) => {
+          e.stopPropagation();
+          Promise.resolve(copyText(text)).then((ok) => {
+            if (!ok) { if (onNotice) onNotice(t('copyFailed')); return; }
+            setCopied(true);
+            if (timer.current) window.clearTimeout(timer.current);
+            timer.current = window.setTimeout(() => setCopied(false), 1200);
+          });
+        };
+
+        // Insert at the live caret: never destroys an existing draft and stays
+        // undoable. insertText() refuses when the composer is busy or the draft
+        // moved, so a refusal is surfaced instead of silently doing nothing.
+        const handleInsert = (e) => {
+          e.stopPropagation();
+          let ok = false;
+          try {
+            if (actions) {
+              const span = actions.captureInsertion();
+              ok = actions.insertText(text, span);
+            }
+          } catch (_) { ok = false; }
+          if (!ok && onNotice) {
+            onNotice(actions ? t('insertBlocked') : t('insertUnavailable'));
+          }
+        };
+
+        const handleKey = (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+            ev.preventDefault();
+            jump();
+          }
+        };
+
+        return h('div', {
+          className: 'dhs-card',
+          role: 'button',
+          tabIndex: 0,
+          onClick: jump,
+          onKeyDown: handleKey,
         },
           // Left chevron, hidden until hover (see .dhs-arrow CSS).
-          h('span', { className: 'dhs-arrow' }, h(ArrowIcon, { size: 16 })),
+          h('span', { className: 'dhs-arrow', 'aria-hidden': 'true' },
+            h(ArrowIcon, { size: 16 })),
           h('div', { className: 'dhs-cardbody' },
             h('div', { className: 'dhs-cardmeta' },
               h('span', { className: 'dhs-ordinal' },
@@ -1160,30 +1373,105 @@
               // Small flat picture icon right after the date when the message
               // carried image attachment(s).
               card.hasImage
-                ? h('span', {
-                    className: 'dhs-imgbadge',
-                    title: t('hasImage'),
-                  }, h(ImageBadgeIcon, { size: 13 }))
+                ? h('span', { className: 'dhs-imgbadge', title: t('hasImage') },
+                  h(ImageBadgeIcon, { size: 13 }))
                 : null,
-              // Blue quote bubble + the ordinal(s) of the message(s) in THIS
-              // conversation that the quoted text came from. loadUserMessages
-              // already resolved each quote to an ordinal (user-sourced via the
-              // card list, assistant/tool-sourced via the prompting turn).
               (card.quotes || []).length > 0
                 ? h('span', {
-                    className: 'dhs-quotebadge',
-                    title: t('quoteFrom', (card.quotes || [])
-                      .map((q) => (q.ordinal ? '#' + q.ordinal : '?'))
-                      .join(', ')),
-                  }, h(QuoteBadgeIcon, { size: 13, color: '#4d6bfe' }),
-                  (card.quotes || [])
-                    .map((q) => (q.ordinal ? '#' + q.ordinal : '?'))
-                    .join('/'))
-                : null),
+                  className: 'dhs-quotebadge',
+                  title: t('quoteFrom', quoteOrdinals.join(', ')),
+                }, h(QuoteBadgeIcon, { size: 13, color: '#4d6bfe' }),
+                quoteOrdinals.join('/'))
+                : null,
+              // Copy / insert ride at the right end of the meta row and only
+              // appear on hover or keyboard focus (visibility keeps layout).
+              h('span', { className: 'dhs-actions' },
+                h('button', {
+                  className: 'dhs-actbtn', type: 'button',
+                  title: copied ? t('copied') : t('copy'),
+                  'aria-label': t('copy'),
+                  onClick: handleCopy,
+                }, copied ? h(CheckIcon, { size: 14 }) : h(CopyIcon, { size: 14 })),
+                h('button', {
+                  className: 'dhs-actbtn', type: 'button',
+                  title: actions ? t('insert') : t('insertUnavailable'),
+                  'aria-label': t('insert'),
+                  disabled: !actions,
+                  onClick: handleInsert,
+                }, h(InsertIcon, { size: 14 })))),
             h('div', { className: 'dhs-cardtext' },
               preview ? highlight(preview, q)
                 : h('span', { className: 'dhs-imgonly' },
                   (card.quotes || []).length > 0 ? t('quoteOnly') : t('imageOnly')))));
+      });
+
+      /* ---------------------------------------------------------------- *
+       * Composer bridge.                                                   *
+       *                                                                    *
+       * `inputActions` is a Session-scoped standard prop (ui-conversation   *
+       * publishes it through uiSession), so a right-sidebar tab can only    *
+       * reach it from inside a session slot. This invisible dock entry      *
+       * parks the action face per session and renders nothing.              *
+       * ---------------------------------------------------------------- */
+      const inputActionsBySession = new Map();
+      const inputActionsListeners = new Set();
+
+      function publishInputActions(sessionId, actions) {
+        if (!sessionId) return;
+        if (actions) inputActionsBySession.set(sessionId, actions);
+        else if (!inputActionsBySession.delete(sessionId)) return;
+        for (const notify of inputActionsListeners) {
+          try { notify(); } catch (_) {}
+        }
+      }
+
+      function InputActionsBridge(props) {
+        const sid = props && (props.dhsSessionId || props.sessionId);
+        const actions = props && props.inputActions;
+        React.useEffect(() => {
+          if (!sid || !actions) return undefined;
+          publishInputActions(sid, actions);
+          return () => publishInputActions(sid, null);
+        }, [sid, actions]);
+        return null;
+      }
+
+      function useInputActions(sessionId) {
+        const read = () => (sessionId ? inputActionsBySession.get(sessionId) : undefined);
+        const [actions, setActions] = React.useState(read);
+        React.useEffect(() => {
+          const sync = () => setActions(read());
+          sync();
+          inputActionsListeners.add(sync);
+          return () => { inputActionsListeners.delete(sync); };
+        }, [sessionId]);
+        return actions;
+      }
+
+      function legacyCopy(text) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.top = '-1000px';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return !!ok;
+        } catch (_) { return false; }
+      }
+
+      function copyText(text) {
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard &&
+              typeof navigator.clipboard.writeText === 'function') {
+            return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
+          }
+        } catch (_) { /* fall through to the DOM path */ }
+        return Promise.resolve(legacyCopy(text));
       }
 
       /* ---------------------------------------------------------------- *
@@ -1193,88 +1481,191 @@
         const p = props || {};
         const t = p.t || ((k) => k);
         const ctx = p.ctx;
-        const useSessions = p.useSessions;
-        const propSessionId = p.sessionId;
         const openView = p.openView;
-
-        const activeId = typeof useSessions === 'function'
-          ? useSessions(currentSessionId) : undefined;
-        const sessionId = propSessionId || activeId;
+        const sessionId = p.sessionId;
 
         const [query, setQuery] = React.useState('');
-        const [items, setItems] = React.useState(null); // null = loading
+        const [items, setItems] = React.useState(null); // null = nothing yet
         const [error, setError] = React.useState('');
+        const [loading, setLoading] = React.useState(true);
         const [reloadKey, setReloadKey] = React.useState(0);
         const [filterImg, setFilterImg] = React.useState(false);
         const [filterQuote, setFilterQuote] = React.useState(false);
+        const [notice, setNotice] = React.useState('');
+
+        const actions = useInputActions(sessionId);
 
         React.useEffect(() => {
-          let alive = true;
-          let timer = null;
-          const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-          let tries = 0;
+          if (!notice) return undefined;
+          const id = window.setTimeout(() => setNotice(''), 2500);
+          return () => window.clearTimeout(id);
+        }, [notice]);
 
-          const finishEmpty = (msg) => {
-            if (!alive) return;
+        // ---- load / revalidate -------------------------------------------
+        // A cached session paints immediately and only pays for a tail sync;
+        // an uncached one runs the full backward sweep once.
+        React.useEffect(() => {
+          if (!sessionId) {
             setItems([]);
-            setError(msg || '');
+            setLoading(false);
+            setError(t('noSession'));
+            return undefined;
+          }
+          let alive = true;
+          const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+          const signal = ac ? ac.signal : undefined;
+          const cache = ensureCache(sessionId);
+          // Paint whatever this session already has; a switch must never show
+          // the previous session's cards while the new load is in flight.
+          setItems(cache.ready ? cache.cards.slice() : null);
+          setLoading(!cache.ready);
+          setError('');
+
+          const rebuild = async (api) => {
+            const { events, complete } = await loadHistory(api, sessionId, signal);
+            if (!alive) return;
+            applyEvents(cache, events, true);
+            cache.historyComplete = complete;
+            cache.ready = true;
+            setItems(cache.cards.slice());
           };
 
-          const run = async () => {
-            if (!sessionId) { finishEmpty(t('noSession')); return; }
-            if (!sessionApi) {
-              if (tries++ < 30) { timer = window.setTimeout(run, 200); return; }
-              finishEmpty(t('noService')); return;
+          const waitForApi = async () => {
+            for (let i = 0; i < 30; i++) {
+              if (!alive) return null;
+              if (sessionApi) return sessionApi;
+              await new Promise((resolve) => window.setTimeout(resolve, 200));
             }
-            if (alive) { setItems(null); setError(''); }
+            return null;
+          };
+
+          (async () => {
+            const api = await waitForApi();
+            if (!alive) return;
+            if (!api) { setLoading(false); setError(t('noService')); return; }
             try {
-              const list = await loadUserMessages(sessionApi, sessionId, ac ? ac.signal : undefined);
+              let merged = false;
+              if (cache.ready) merged = await syncTail(api, sessionId, cache, signal);
+              if (!merged && alive) await rebuild(api);
               if (!alive) return;
-              // Ordinal = "the Nth message you sent", counted oldest -> newest.
-              // seq is monotonic, so ascending seq is exactly chronological order.
-              const chrono = list.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
-              chrono.forEach((card, i) => { card.ordinal = i + 1; });
-              setItems(list);
+              setItems(cache.cards.slice());
+              setLoading(false);
             } catch (err) {
               if (!alive) return;
-              const msg = (err && err.message) ? err.message : String(err);
-              finishEmpty(t('failed', msg));
+              if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
+              setLoading(false);
+              setError(t('failed', (err && err.message) ? err.message : String(err)));
+            }
+          })();
+
+          return () => {
+            alive = false;
+            try { if (ac) ac.abort(); } catch (_) {}
+          };
+        }, [sessionId, reloadKey]);
+
+        // ---- live updates -------------------------------------------------
+        // The chat view's own Session publishes its loaded window; merging by
+        // seq turns every append into a card without re-fetching anything.
+        React.useEffect(() => {
+          if (!sessionId) return undefined;
+          let alive = true;
+          let unsubscribe = null;
+          let owner = null;
+          let timer = 0;
+
+          const resync = async () => {
+            if (!alive || !sessionApi) return;
+            const cache = CACHE.get(sessionId);
+            if (!cache || !cache.ready) return;
+            try {
+              const ok = await syncTail(sessionApi, sessionId, cache, undefined);
+              if (ok && alive) setItems(cache.cards.slice());
+            } catch (_) { /* the next notification retries */ }
+          };
+
+          const merge = (events) => {
+            if (!alive) return;
+            const cache = CACHE.get(sessionId);
+            if (!cache || !cache.ready) return;
+            const before = cache.lastSeq;
+            if (applyEvents(cache, events, false)) setItems(cache.cards.slice());
+            // A jump in seq numbers means events we never saw (the window was
+            // replaced after a reconnect): one tail sync closes the hole.
+            let first;
+            for (const e of events) {
+              if (typeof e.seq !== 'number') continue;
+              if (first === undefined || e.seq < first) first = e.seq;
+            }
+            if (first !== undefined && first > before + 1 && !timer) {
+              timer = window.setTimeout(() => { timer = 0; void resync(); }, 300);
             }
           };
-          run();
+
+          const onChange = () => {
+            if (!alive) return;
+            const live = liveBinding(sessionId);
+            if (!live) return;
+            if (owner && live.binding !== owner) {
+              // The controller replaced the generation: resubscribe once.
+              try { if (unsubscribe) unsubscribe(); } catch (_) {}
+              owner = live.binding;
+              try { unsubscribe = live.source.subscribe(onChange); } catch (_) { unsubscribe = null; }
+            }
+            merge(eventsFromSnapshot(live.source.getSnapshot()));
+          };
+
+          const attach = () => {
+            const live = liveBinding(sessionId);
+            if (!live) return false;
+            owner = live.binding;
+            try { unsubscribe = live.source.subscribe(onChange); } catch (_) { return false; }
+            return true;
+          };
+
+          if (!attach()) {
+            const id = window.setTimeout(() => { if (alive) attach(); }, 800);
+            return () => { alive = false; window.clearTimeout(id); };
+          }
           return () => {
             alive = false;
             if (timer) window.clearTimeout(timer);
-            try { if (ac) ac.abort(); } catch (_) {}
+            try { if (unsubscribe) unsubscribe(); } catch (_) {}
           };
-        }, [sessionId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
+        }, [sessionId]);
 
-        const q = query.trim();
-        const qLower = q.toLowerCase();
+        // ---- derived list -------------------------------------------------
+        const deferredQuery = React.useDeferredValue(query);
+        const shown = React.useMemo(() => {
+          const needle = (deferredQuery || '').trim();
+          const lower = needle.toLowerCase();
+          const out = (items || []).filter((c) => {
+            if (needle && c.text.toLowerCase().indexOf(lower) === -1) return false;
+            if (filterImg && !c.hasImage) return false;
+            if (filterQuote && !(c.quotes && c.quotes.length > 0)) return false;
+            return true;
+          });
+          // Newest first; seq is a monotonic log offset.
+          out.sort((a, b) => (b.seq || 0) - (a.seq || 0));
+          return out;
+        }, [items, deferredQuery, filterImg, filterQuote]);
+
+        const q = (deferredQuery || '').trim();
         const list = items || [];
-        // Keyword + the two toggle filters stack (AND).
-        const shown = list.filter((c) => {
-          if (q && c.text.toLowerCase().indexOf(qLower) === -1) return false;
-          if (filterImg && !c.hasImage) return false;
-          if (filterQuote && !(c.quotes && c.quotes.length > 0)) return false;
-          return true;
-        });
-        // Newest first; seq is a monotonic log offset.
-        shown.sort((a, b) => (b.seq || 0) - (a.seq || 0));
         const hasFilter = !!q || filterImg || filterQuote;
-
         const timeLocale = (t('time') === 'en-US') ? 'en-US' : 'zh-CN';
 
-        // Count chip: "…" while loading, "!" on failure, total when idle, and
-        // "matched/total" while any filter is active. A locale-specific unit
+        // Counter: "…" while loading, "!" on failure, total when idle, and
+        // "matched/total" while any filter is active. The locale-specific unit
         // suffix ("条" in Chinese) rides along.
         const unit = t('unit') || '';
         const withUnit = (s) => (unit ? s + ' ' + unit : s);
-        const counterText = items === null ? '…'
+        const counterText = loading && items === null ? '…'
           : error ? '!'
             : hasFilter ? withUnit(shown.length + '/' + list.length)
               : withUnit(String(list.length));
         const counterTitle = hasFilter ? t('match', shown.length) : t('count', list.length);
+        const showEmpty = !loading && !error && shown.length === 0;
 
         return h('div', {
           className: 'dhs-root',
@@ -1285,15 +1676,13 @@
           // Scrolling column: the frosted bar sticks near its top, cards slide
           // underneath it and show through blurred.
           h('div', { className: 'dhs-list' },
-
-            // Frosted search bar (inside the scrollport so the frosted effect
-            // has content to blur; sticky top == list padding-top).
             h('div', { className: 'dhs-searchbar' },
               h('div', { className: 'dhs-searchbox' },
                 h('span', { className: 'dhs-searchicon' }, h(SearchIcon, { size: 17 })),
                 h('input', {
                   className: 'dhs-input', type: 'text', value: query,
                   placeholder: t('search'),
+                  'aria-label': t('search'),
                   onChange: (e) => setQuery(e.target.value),
                 })),
               h('div', { className: 'dhs-counter', title: counterTitle }, counterText),
@@ -1313,15 +1702,53 @@
               }, h(QuoteBadgeIcon, { size: 15 })),
               h('button', {
                 className: 'dhs-iconbtn', type: 'button', title: t('refresh'),
-                onClick: () => setReloadKey((k) => k + 1),
+                onClick: () => {
+                  // Manual refresh means "start over": drop the cache entry and
+                  // let the load effect rebuild it from scratch.
+                  if (sessionId) CACHE.delete(sessionId);
+                  setReloadKey((k) => k + 1);
+                },
               }, h(RefreshIcon))),
 
-            // Failure detail (the chip only shows "!").
-            error ? h('div', { className: 'dhs-status is-error' }, error) : null,
+            // Failure detail (the chip only shows "!"), with a retry affordance.
+            error
+              ? h('div', { className: 'dhs-status is-error' },
+                error,
+                h('button', {
+                  className: 'dhs-retry', type: 'button',
+                  onClick: () => setReloadKey((k) => k + 1),
+                }, t('retry')))
+              : null,
+            notice ? h('div', { className: 'dhs-status', role: 'status' }, notice) : null,
+            showEmpty
+              ? h('div', { className: 'dhs-empty' },
+                hasFilter ? t('emptyMatch') : t('emptyAll'))
+              : null,
+            shown.map((card) => h(Card, {
+              key: String(card.seq) + ':' + (card.id || ''),
+              card, q, t, ctx, openView, sessionId, timeLocale, actions,
+              onNotice: setNotice,
+            }))));
+      }
 
-            // Cards. `items` (the full list) rides along so quote badges can
-            // resolve their source-message ordinals.
-            renderCardList(list, items, shown, q, hasFilter, t, ctx, openView, sessionId, timeLocale)));
+      /* ---------------------------------------------------------------- *
+       * Session resolution wrapper.                                        *
+       *                                                                    *
+       * The `useSessions` prop is optional, so the hook lives in a child    *
+       * component instead of being called conditionally in the panel.       *
+       * ---------------------------------------------------------------- */
+      function HistoryPanelWithSession(props) {
+        const p = props || {};
+        const activeId = p.useSessions(currentSessionId);
+        return h(HistoryPanel, Object.assign({}, p, {
+          sessionId: p.sessionId || activeId,
+        }));
+      }
+
+      function HistoryTabEntry(props) {
+        const p = props || {};
+        if (typeof p.useSessions !== 'function') return h(HistoryPanel, p);
+        return h(HistoryPanelWithSession, p);
       }
 
       /* ---------------------------------------------------------------- *
@@ -1404,7 +1831,7 @@
                 }
                 owned.push(sidebarCtx.slots.inject('sidebar.right.pane.tab', () =>
                   sidebarCtx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID },
-                    (slotProps) => h(HistoryPanel, Object.assign({}, slotProps, {
+                    (slotProps) => h(HistoryTabEntry, Object.assign({}, slotProps, {
                       t, ctx: sidebarCtx,
                     })))));
                 owned.push(sidebarCtx.slots.inject('sidebar.right.pane.tab.title', () =>
@@ -1416,6 +1843,31 @@
               }
               return cleanup;
             }, 'dsh-history-search: right sidebar tab');
+          });
+        } catch (_) { /* optional */ }
+
+        // Composer bridge: an invisible dock row inside the conversation gives
+        // this bundle the Session-scoped `inputActions` face (insert/capture),
+        // which a sidebar tab cannot reach on its own. It renders null; when
+        // the slot or the prop is absent on this host build, the card's insert
+        // button degrades to a disabled control instead of throwing.
+        try {
+          ctx.inject(['slots'], (dockCtx) => {
+            dockCtx.effect(() => {
+              let dispose = null;
+              try {
+                dispose = dockCtx.slots.inject('conversation.input.dock', () =>
+                  dockCtx.slots.register({
+                    name: 'conversation.input.dock',
+                    id: 'dsh-history-search-actions',
+                    order: 900,
+                    inject: (sessionId) => ({ dhsSessionId: sessionId }),
+                  }, InputActionsBridge));
+              } catch (err) {
+                try { console.warn('[dsh-history-search] composer bridge unavailable', err); } catch (_) {}
+              }
+              return () => { try { if (dispose) dispose(); } catch (_) {} };
+            }, 'dsh-history-search: composer bridge');
           });
         } catch (_) { /* optional */ }
       }
