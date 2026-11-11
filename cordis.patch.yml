@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-history-search
+      name: '@local/dsh-history-search'

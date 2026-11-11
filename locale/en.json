@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "History search",
+    "description": "Adds a right-sidebar tab that lists your past messages in the current conversation, filters them by keyword, and jumps to the matching message."
+  }
+}

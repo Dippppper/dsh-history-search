@@ -1,0 +1,4 @@
+# Keep line endings stable across Windows and POSIX checkouts.
+* text=auto eol=lf
+*.png binary
+*.svg text
